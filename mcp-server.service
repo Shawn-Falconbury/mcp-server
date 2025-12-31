@@ -1,0 +1,25 @@
+[Unit]
+Description=MCP Server - Custom tools for Claude Code
+After=network.target mnt-enc_shawn.mount
+Wants=mnt-enc_shawn.mount
+
+[Service]
+Type=simple
+User=shawn
+WorkingDirectory=/home/shawn/projects/mcp-server
+EnvironmentFile=/home/shawn/projects/mcp-server/.env
+ExecStart=/usr/bin/npx tsx src/index.ts
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/shawn/projects
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
