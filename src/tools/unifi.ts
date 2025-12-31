@@ -1,4 +1,4 @@
-import https from 'node:https';
+import { Agent } from 'undici';
 import { registerTool } from './index.js';
 
 // UniFi API configuration
@@ -20,9 +20,11 @@ function getUniFiConfig(): UniFiConfig | null {
   return { host, apiKey, site };
 }
 
-// Custom HTTPS agent to handle self-signed certificates
-const httpsAgent = new https.Agent({
-  rejectUnauthorized: false, // UDM often uses self-signed certs
+// Custom undici agent to handle self-signed certificates
+const unifiAgent = new Agent({
+  connect: {
+    rejectUnauthorized: false, // UDM often uses self-signed certs
+  },
 });
 
 // Type for UniFi API responses
@@ -44,15 +46,15 @@ async function unifiRequest(
 
   const url = `https://${config.host}${endpoint}`;
 
-  const options: RequestInit = {
+  const options: RequestInit & { dispatcher?: Agent } = {
     method,
     headers: {
       'X-API-KEY': config.apiKey,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     },
-    // @ts-expect-error - Node.js fetch accepts agent option
-    agent: httpsAgent,
+    // @ts-expect-error - Node.js fetch accepts dispatcher option from undici
+    dispatcher: unifiAgent,
   };
 
   if (body) {
