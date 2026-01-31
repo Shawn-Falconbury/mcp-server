@@ -24,6 +24,9 @@ const ALLOWED_COMMANDS = new Set([
   'cat /proc/cpuinfo',
   'cat /proc/meminfo',
   'cat /sys/class/thermal/thermal_zone0/temp',
+  'git',       // Git version control
+  'gh',        // GitHub CLI
+  'rm',        // File removal (use with caution)
 ]);
 
 // Check if command is in whitelist
@@ -87,7 +90,7 @@ registerTool({
 registerTool({
   tool: {
     name: 'run_command',
-    description: 'Run a whitelisted system command. Allowed commands: uptime, hostname, df, free, top -bn1, ps, who, date, uname, lsblk, lscpu, vcgencmd',
+    description: 'Run a whitelisted system command. Allowed commands: uptime, hostname, df, free, top, ps, who, date, uname, lsblk, lscpu, vcgencmd, git, gh',
     inputSchema: {
       type: 'object',
       properties: {

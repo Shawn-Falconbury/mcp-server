@@ -9,7 +9,7 @@ import express, { type Express, type Request, type Response } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import { authMiddleware } from './auth.js';
-import { getAllTools, callTool } from './tools/index.js';
+import { getAllTools, getTool, callTool } from './tools/index.js';
 
 export function createApp(): Express {
   const app = express();
@@ -122,4 +122,82 @@ export async function setupMCPRoutes(app: Express, server: Server): Promise<void
       res.status(404).json({ error: 'Session not found' });
     }
   });
+}
+
+// ============================================================================
+// REST API Routes - Simple direct tool access without MCP protocol
+// ============================================================================
+
+export function setupRESTRoutes(app: Express): void {
+  // GET /api/tools - List all available tools
+  app.get('/api/tools', authMiddleware, (_req: Request, res: Response) => {
+    const tools = getAllTools();
+    console.log(`[API] Listing ${tools.length} tools`);
+    res.json({
+      count: tools.length,
+      tools: tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+      })),
+    });
+  });
+
+  // GET /api/tools/:name - Get info for a specific tool
+  app.get('/api/tools/:name', authMiddleware, (req: Request, res: Response) => {
+    const tool = getTool(req.params.name);
+    if (!tool) {
+      res.status(404).json({ error: `Tool not found: ${req.params.name}` });
+      return;
+    }
+    res.json({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    });
+  });
+
+  // POST /api/tools/:name - Execute a tool
+  app.post('/api/tools/:name', authMiddleware, async (req: Request, res: Response) => {
+    const toolName = req.params.name;
+    const args = req.body || {};
+
+    console.log(`[API] Calling tool: ${toolName}`);
+
+    try {
+      const result = await callTool(toolName, args);
+
+      // Transform MCP result format to cleaner REST response
+      const response: Record<string, unknown> = {
+        success: !result.isError,
+        tool: toolName,
+      };
+
+      // Parse JSON content if possible, otherwise return raw text
+      if (result.content?.[0]?.type === 'text') {
+        const text = result.content[0].text as string;
+        try {
+          response.data = JSON.parse(text);
+        } catch {
+          response.data = text;
+        }
+      }
+
+      if (result.isError) {
+        res.status(400).json(response);
+      } else {
+        res.json(response);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[API] Error in ${toolName}:`, message);
+      res.status(500).json({
+        success: false,
+        tool: toolName,
+        error: message,
+      });
+    }
+  });
+
+  console.log('[SERVER] REST API routes registered');
 }

@@ -4,7 +4,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createApp, createMCPServer, setupMCPRoutes } from './server.js';
+import { createApp, createMCPServer, setupMCPRoutes, setupRESTRoutes } from './server.js';
 
 // Import and register tools
 import './tools/filesystem.js';
@@ -12,6 +12,7 @@ import './tools/system.js';
 import './tools/obsidian.js';
 import './tools/database.js';
 import './tools/unifi.js';
+import './tools/jupyter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
@@ -30,7 +31,10 @@ async function main(): Promise<void> {
   const app = createApp();
   const mcpServer = createMCPServer();
 
-  // Set up MCP routes
+  // Set up REST API routes (simple direct tool access)
+  setupRESTRoutes(app);
+
+  // Set up MCP routes (full protocol support)
   await setupMCPRoutes(app, mcpServer);
 
   // Start server
@@ -55,6 +59,7 @@ async function main(): Promise<void> {
     https.createServer(httpsOptions, app).listen(port, '0.0.0.0', () => {
       console.log(`[SERVER] MCP server running on https://0.0.0.0:${port}`);
       console.log(`[SERVER] Health check: https://localhost:${port}/health`);
+      console.log(`[SERVER] REST API: https://localhost:${port}/api/tools`);
       console.log(`[SERVER] MCP endpoint: https://localhost:${port}/mcp`);
     });
   } else {

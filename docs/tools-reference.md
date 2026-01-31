@@ -2,14 +2,66 @@
 
 Complete reference for all tools available on the MCP server.
 
+**Total Tools: 34**
+
 ## Table of Contents
 
+- [REST API Usage](#rest-api-usage)
 - [Filesystem Tools](#filesystem-tools)
 - [System Tools](#system-tools)
 - [Obsidian Tools](#obsidian-tools)
 - [Database Tools](#database-tools)
 - [UniFi Tools](#unifi-tools)
 - [UniFi Threat Management Tools](#unifi-threat-management-tools)
+
+---
+
+## REST API Usage
+
+Tools can be called directly via REST API without MCP protocol handshake.
+
+### List All Tools
+
+```bash
+curl https://your-server.example.com:8443/api/tools \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+### Get Tool Info
+
+```bash
+curl https://your-server.example.com:8443/api/tools/unifi_get_network_health \
+  -H "Authorization: Bearer YOUR_TOKEN"
+```
+
+### Execute a Tool
+
+```bash
+curl -X POST https://your-server.example.com:8443/api/tools/TOOL_NAME \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"arg1": "value1", "arg2": "value2"}'
+```
+
+### Response Format
+
+**Success:**
+```json
+{
+  "success": true,
+  "tool": "tool_name",
+  "data": { ... }
+}
+```
+
+**Error:**
+```json
+{
+  "success": false,
+  "tool": "tool_name",
+  "error": "Error message"
+}
+```
 
 ---
 

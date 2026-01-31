@@ -21,6 +21,10 @@ export function getToolHandler(name: string): ToolDefinition['handler'] | undefi
   return toolRegistry.get(name)?.handler;
 }
 
+export function getTool(name: string): Tool | undefined {
+  return toolRegistry.get(name)?.tool;
+}
+
 export async function callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
   const handler = getToolHandler(name);
 

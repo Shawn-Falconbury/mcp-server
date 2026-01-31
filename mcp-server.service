@@ -1,7 +1,6 @@
 [Unit]
 Description=MCP Server - Custom tools for Claude Code
-After=[TARGET PATH]
-Wants=[TARGET PATH]
+After=network.target
 
 [Service]
 Type=simple

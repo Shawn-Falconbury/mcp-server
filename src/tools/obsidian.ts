@@ -410,4 +410,411 @@ registerTool({
   },
 });
 
+// Create note tool
+registerTool({
+  tool: {
+    name: 'create_note',
+    description: 'Create a new note in the Obsidian vault',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path for the new note relative to vault root (without .md extension)',
+        },
+        content: {
+          type: 'string',
+          description: 'Markdown content for the note',
+        },
+        frontmatter: {
+          type: 'object',
+          description: 'Optional key-value pairs for YAML frontmatter',
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'If true, overwrite existing note (default: false)',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  handler: async (args) => {
+    const vaultPath = getVaultPath();
+    if (!vaultPath || !(await isVaultAvailable())) {
+      return {
+        content: [{ type: 'text', text: 'Obsidian vault not configured or not available' }],
+        isError: true,
+      };
+    }
+
+    let notePath = args.path as string;
+    if (!notePath.endsWith('.md')) {
+      notePath += '.md';
+    }
+
+    const fullPath = path.join(vaultPath, notePath);
+
+    // Security check - ensure path is within vault
+    const resolved = path.resolve(fullPath);
+    if (!resolved.startsWith(path.resolve(vaultPath))) {
+      return {
+        content: [{ type: 'text', text: 'Access denied: path outside vault' }],
+        isError: true,
+      };
+    }
+
+    const overwrite = args.overwrite as boolean || false;
+    const frontmatter = args.frontmatter as Record<string, unknown> | undefined;
+    const content = args.content as string;
+
+    try {
+      // Check if note already exists
+      try {
+        await fs.access(fullPath);
+        if (!overwrite) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, path: notePath, message: 'Note already exists. Set overwrite: true to replace it.' }, null, 2) }],
+            isError: true,
+          };
+        }
+      } catch {
+        // File doesn't exist, which is expected
+      }
+
+      // Create parent directories if they don't exist
+      const parentDir = path.dirname(fullPath);
+      await fs.mkdir(parentDir, { recursive: true });
+
+      // Build the file content
+      let fileContent = '';
+
+      if (frontmatter && Object.keys(frontmatter).length > 0) {
+        const yamlLines: string[] = ['---'];
+        for (const [key, value] of Object.entries(frontmatter)) {
+          if (Array.isArray(value)) {
+            yamlLines.push(`${key}:`);
+            for (const item of value) {
+              yamlLines.push(`  - ${item}`);
+            }
+          } else {
+            yamlLines.push(`${key}: ${value}`);
+          }
+        }
+        yamlLines.push('---');
+        fileContent = yamlLines.join('\n') + '\n' + content;
+      } else {
+        fileContent = content;
+      }
+
+      await fs.writeFile(fullPath, fileContent, 'utf-8');
+
+      console.log(`[OBSIDIAN] Created note: ${notePath}`);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: true, path: notePath, message: 'Note created successfully' }, null, 2),
+        }],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Failed to create note: ${message}` }],
+        isError: true,
+      };
+    }
+  },
+});
+
+// Update note tool
+registerTool({
+  tool: {
+    name: 'update_note',
+    description: 'Replace the entire content of an existing note',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path to the note relative to vault root',
+        },
+        content: {
+          type: 'string',
+          description: 'New markdown content',
+        },
+        preserveFrontmatter: {
+          type: 'boolean',
+          description: 'If true, keep existing frontmatter (default: false)',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  handler: async (args) => {
+    const vaultPath = getVaultPath();
+    if (!vaultPath || !(await isVaultAvailable())) {
+      return {
+        content: [{ type: 'text', text: 'Obsidian vault not configured or not available' }],
+        isError: true,
+      };
+    }
+
+    let notePath = args.path as string;
+    if (!notePath.endsWith('.md')) {
+      notePath += '.md';
+    }
+
+    const fullPath = path.join(vaultPath, notePath);
+
+    // Security check - ensure path is within vault
+    const resolved = path.resolve(fullPath);
+    if (!resolved.startsWith(path.resolve(vaultPath))) {
+      return {
+        content: [{ type: 'text', text: 'Access denied: path outside vault' }],
+        isError: true,
+      };
+    }
+
+    const preserveFrontmatter = args.preserveFrontmatter as boolean || false;
+    const newContent = args.content as string;
+
+    try {
+      // Check if note exists
+      try {
+        await fs.access(fullPath);
+      } catch {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, path: notePath, message: 'Note does not exist' }, null, 2) }],
+          isError: true,
+        };
+      }
+
+      let fileContent = newContent;
+
+      if (preserveFrontmatter) {
+        const existingContent = await fs.readFile(fullPath, 'utf-8');
+        const { frontmatter } = parseFrontmatter(existingContent);
+
+        if (Object.keys(frontmatter).length > 0) {
+          const yamlLines: string[] = ['---'];
+          for (const [key, value] of Object.entries(frontmatter)) {
+            if (Array.isArray(value)) {
+              yamlLines.push(`${key}:`);
+              for (const item of value) {
+                yamlLines.push(`  - ${item}`);
+              }
+            } else {
+              yamlLines.push(`${key}: ${value}`);
+            }
+          }
+          yamlLines.push('---');
+          fileContent = yamlLines.join('\n') + '\n' + newContent;
+        }
+      }
+
+      await fs.writeFile(fullPath, fileContent, 'utf-8');
+
+      console.log(`[OBSIDIAN] Updated note: ${notePath}`);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: true, path: notePath, message: 'Note updated successfully' }, null, 2),
+        }],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Failed to update note: ${message}` }],
+        isError: true,
+      };
+    }
+  },
+});
+
+// Append to note tool
+registerTool({
+  tool: {
+    name: 'append_to_note',
+    description: 'Add content to the end of an existing note',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path to the note relative to vault root',
+        },
+        content: {
+          type: 'string',
+          description: 'Content to append',
+        },
+        separator: {
+          type: 'string',
+          description: 'String to insert before appended content (default: "\\n\\n")',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  handler: async (args) => {
+    const vaultPath = getVaultPath();
+    if (!vaultPath || !(await isVaultAvailable())) {
+      return {
+        content: [{ type: 'text', text: 'Obsidian vault not configured or not available' }],
+        isError: true,
+      };
+    }
+
+    let notePath = args.path as string;
+    if (!notePath.endsWith('.md')) {
+      notePath += '.md';
+    }
+
+    const fullPath = path.join(vaultPath, notePath);
+
+    // Security check - ensure path is within vault
+    const resolved = path.resolve(fullPath);
+    if (!resolved.startsWith(path.resolve(vaultPath))) {
+      return {
+        content: [{ type: 'text', text: 'Access denied: path outside vault' }],
+        isError: true,
+      };
+    }
+
+    const contentToAppend = args.content as string;
+    const separator = (args.separator as string) ?? '\n\n';
+
+    try {
+      // Check if note exists
+      let existingContent: string;
+      try {
+        existingContent = await fs.readFile(fullPath, 'utf-8');
+      } catch {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, path: notePath, message: 'Note does not exist' }, null, 2) }],
+          isError: true,
+        };
+      }
+
+      const newContent = existingContent + separator + contentToAppend;
+      await fs.writeFile(fullPath, newContent, 'utf-8');
+
+      console.log(`[OBSIDIAN] Appended to note: ${notePath}`);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ success: true, path: notePath, message: 'Content appended successfully' }, null, 2),
+        }],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Failed to append to note: ${message}` }],
+        isError: true,
+      };
+    }
+  },
+});
+
+// Delete note tool
+registerTool({
+  tool: {
+    name: 'delete_note',
+    description: 'Delete a note (moves to .trash folder)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path to the note relative to vault root',
+        },
+        confirm: {
+          type: 'boolean',
+          description: 'Must be true to proceed with deletion',
+        },
+      },
+      required: ['path', 'confirm'],
+    },
+  },
+  handler: async (args) => {
+    const vaultPath = getVaultPath();
+    if (!vaultPath || !(await isVaultAvailable())) {
+      return {
+        content: [{ type: 'text', text: 'Obsidian vault not configured or not available' }],
+        isError: true,
+      };
+    }
+
+    const confirm = args.confirm as boolean;
+    if (!confirm) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: false, message: 'Deletion not confirmed. Set confirm: true to proceed.' }, null, 2) }],
+        isError: true,
+      };
+    }
+
+    let notePath = args.path as string;
+    if (!notePath.endsWith('.md')) {
+      notePath += '.md';
+    }
+
+    const fullPath = path.join(vaultPath, notePath);
+
+    // Security check - ensure path is within vault
+    const resolved = path.resolve(fullPath);
+    if (!resolved.startsWith(path.resolve(vaultPath))) {
+      return {
+        content: [{ type: 'text', text: 'Access denied: path outside vault' }],
+        isError: true,
+      };
+    }
+
+    try {
+      // Check if note exists
+      try {
+        await fs.access(fullPath);
+      } catch {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, path: notePath, message: 'Note does not exist' }, null, 2) }],
+          isError: true,
+        };
+      }
+
+      // Try to move to .trash folder
+      const trashPath = path.join(vaultPath, '.trash');
+      const trashedNotePath = path.join(trashPath, path.basename(notePath));
+
+      let movedToTrash = false;
+      try {
+        await fs.mkdir(trashPath, { recursive: true });
+        await fs.rename(fullPath, trashedNotePath);
+        movedToTrash = true;
+      } catch {
+        // If moving to trash fails, delete permanently
+        await fs.unlink(fullPath);
+      }
+
+      console.log(`[OBSIDIAN] Deleted note: ${notePath} (trash: ${movedToTrash})`);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            path: notePath,
+            message: movedToTrash ? 'Note moved to trash' : 'Note deleted permanently (trash unavailable)',
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Failed to delete note: ${message}` }],
+        isError: true,
+      };
+    }
+  },
+});
+
 console.log('[TOOLS] Obsidian tools loaded');

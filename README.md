@@ -30,7 +30,7 @@ A custom [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/Shawn-Falconbury/mcp-server.git
+   git clone https://github.com/your-username/mcp-server.git
    cd mcp-server
    ```
 
@@ -118,16 +118,22 @@ sudo systemctl enable mcp-server
 sudo systemctl start mcp-server
 ```
 
-## Connecting Claude Code
+## Connecting Clients
 
-Add to your Claude Code MCP settings:
+### Claude Code (CLI)
+
+```bash
+claude mcp add --transport http my-mcp https://your-server.example.com:8443/mcp \
+  --header "Authorization: Bearer YOUR_MCP_TOKEN"
+```
+
+Or add to your project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "my-mcp-server": {
-      "type": "http",
-      "url": "https://your-server:8443/mcp",
+    "my-mcp": {
+      "url": "https://your-server.example.com:8443/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_MCP_TOKEN"
       }
@@ -135,6 +141,27 @@ Add to your Claude Code MCP settings:
   }
 }
 ```
+
+### Claude Desktop
+
+Add to your Claude Desktop config file:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "my-mcp": {
+      "url": "https://your-server.example.com:8443/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_MCP_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving.
 
 ## Available Tools
 
@@ -148,7 +175,9 @@ See [docs/tools-reference.md](docs/tools-reference.md) for complete tool documen
 | System | 4 | System info and commands |
 | Obsidian | 4 | Vault notes and search |
 | Database | 3 | SQLite queries |
-| UniFi | 17 | Network management and security |
+| UniFi | 19 | Network management and security |
+
+**Total: 34 tools**
 
 ## Project Structure
 
@@ -174,10 +203,45 @@ mcp-server/
 
 ## API Endpoints
 
+The server provides two ways to access tools:
+
+### REST API (Simple)
+
+Direct tool access without MCP protocol handshake. Best for scripts, automation, and testing.
+
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check |
-| `/mcp` | POST | Yes | MCP protocol endpoint |
+| `/api/tools` | GET | Yes | List all available tools with schemas |
+| `/api/tools/:name` | GET | Yes | Get info for a specific tool |
+| `/api/tools/:name` | POST | Yes | Execute a tool (args in request body) |
+
+**Example - Single request to call a tool:**
+```bash
+curl -X POST https://your-server.example.com:8443/api/tools/unifi_get_network_health \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+**Response format:**
+```json
+{
+  "success": true,
+  "tool": "unifi_get_network_health",
+  "data": { ... }
+}
+```
+
+### MCP Protocol (Full)
+
+Standard MCP protocol with session management. Required for Claude Code and Claude Desktop.
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/mcp` | GET | Yes | Server info |
+| `/mcp` | POST | Yes | MCP protocol messages |
+| `/mcp` | DELETE | Yes | Close session |
 
 ## License
 

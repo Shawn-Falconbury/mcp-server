@@ -53,7 +53,6 @@ async function unifiRequest(
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     },
-    // @ts-expect-error - Node.js fetch accepts dispatcher option from undici
     dispatcher: unifiAgent,
   };
 
