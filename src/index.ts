@@ -13,6 +13,7 @@ import './tools/obsidian.js';
 import './tools/database.js';
 import './tools/unifi.js';
 import './tools/jupyter.js';
+import './tools/ansible.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
