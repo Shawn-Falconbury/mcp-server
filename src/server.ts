@@ -57,42 +57,105 @@ export function createMCPServer(): Server {
   return server;
 }
 
-export async function setupMCPRoutes(app: Express, server: Server): Promise<void> {
-  // Store active transports by session ID
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+// Send a keepalive ping every 25s so idle connections survive the ~15min
+// upstream idle timeout. A successful ping proves the client is alive.
+const HEARTBEAT_INTERVAL_MS = 25_000;
+// Reap sessions with no request AND no successful ping for this long.
+// onclose never fires for silently-dropped connections, so this sweep is
+// what actually prevents the session map from growing forever.
+const SESSION_IDLE_TIMEOUT_MS = 15 * 60_000;
+const REAPER_INTERVAL_MS = 60_000;
 
-  // MCP endpoint - handles all MCP protocol messages
+interface SessionEntry {
+  transport: StreamableHTTPServerTransport;
+  server: Server;
+  lastSeen: number;
+  heartbeat?: NodeJS.Timeout;
+}
+
+export function setupMCPRoutes(app: Express): void {
+  // Active sessions by session ID. Each session gets its OWN Server instance:
+  // the SDK routes responses through the most recently connected transport, so
+  // sharing one Server across sessions misdelivers responses after reconnects.
+  const sessions = new Map<string, SessionEntry>();
+
+  // Periodic sweep for sessions whose connection died without a clean close
+  setInterval(() => {
+    const now = Date.now();
+    for (const [sid, entry] of sessions) {
+      const idleMs = now - entry.lastSeen;
+      if (idleMs > SESSION_IDLE_TIMEOUT_MS) {
+        console.log(`[MCP] Reaping stale session: ${sid} (idle ${Math.round(idleMs / 1000)}s)`);
+        // close() fires onclose, which removes the entry and clears the heartbeat
+        entry.transport.close().catch((err) => {
+          console.error(`[MCP] Error closing stale session ${sid}:`, err);
+          sessions.delete(sid);
+        });
+      }
+    }
+  }, REAPER_INTERVAL_MS).unref();
+
+  // MCP endpoint - handles all MCP protocol messages.
+  // DELETE (session termination) is also handled here: transport.handleRequest()
+  // implements it and fires onclose for cleanup.
   app.all('/mcp', authMiddleware, async (req: Request, res: Response) => {
     // Check for existing session
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     let transport: StreamableHTTPServerTransport;
 
-    if (sessionId && transports.has(sessionId)) {
+    if (sessionId && sessions.has(sessionId)) {
       // Reuse existing transport
-      transport = transports.get(sessionId)!;
+      const entry = sessions.get(sessionId)!;
+      entry.lastSeen = Date.now();
+      transport = entry.transport;
     } else if (req.method === 'POST' && !sessionId) {
-      // New session - create transport
+      // New session - create a dedicated transport + server pair
+      const server = createMCPServer();
+
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
         onsessioninitialized: (newSessionId) => {
-          transports.set(newSessionId, transport);
-          console.log(`[MCP] New session: ${newSessionId}`);
+          const entry: SessionEntry = { transport, server, lastSeen: Date.now() };
+          // Heartbeat doubles as a liveness probe: only a client response
+          // refreshes lastSeen, so dead peers age out via the reaper.
+          entry.heartbeat = setInterval(() => {
+            server
+              .ping()
+              .then(() => {
+                entry.lastSeen = Date.now();
+              })
+              .catch(() => {
+                // No SSE stream open or client unresponsive - reaper decides
+              });
+          }, HEARTBEAT_INTERVAL_MS);
+          sessions.set(newSessionId, entry);
+          console.log(`[MCP] New session: ${newSessionId} (${sessions.size} active)`);
         },
       });
 
-      // Clean up on close
-      transport.onclose = () => {
-        const sid = (transport as unknown as { sessionId?: string }).sessionId;
-        if (sid) {
-          transports.delete(sid);
-          console.log(`[MCP] Session closed: ${sid}`);
+      // Clean up on close. Must be set BEFORE server.connect() so the SDK
+      // chains it (connect wraps any existing onclose/onerror handlers).
+      const cleanup = (reason: string) => {
+        const sid = transport.sessionId;
+        if (!sid) return;
+        const entry = sessions.get(sid);
+        if (entry) {
+          clearInterval(entry.heartbeat);
+          sessions.delete(sid);
+          console.log(`[MCP] Session closed: ${sid} - ${reason} (${sessions.size} active)`);
         }
       };
+      transport.onclose = () => cleanup('closed');
+      transport.onerror = (error) => {
+        console.error(`[MCP] Transport error on session ${transport.sessionId}:`, error);
+        // Ensure cleanup fires on error paths too; close() triggers onclose
+        transport.close().catch(() => cleanup('error'));
+      };
 
-      // Connect transport to server
+      // Connect transport to its dedicated server
       await server.connect(transport);
-    } else if (sessionId && !transports.has(sessionId)) {
+    } else if (sessionId && !sessions.has(sessionId)) {
       // Invalid session
       res.status(400).json({ error: 'Invalid session ID' });
       return;
@@ -108,19 +171,6 @@ export async function setupMCPRoutes(app: Express, server: Server): Promise<void
 
     // Handle the request
     await transport.handleRequest(req, res, req.body);
-  });
-
-  // Session cleanup endpoint
-  app.delete('/mcp', authMiddleware, async (req: Request, res: Response) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (sessionId && transports.has(sessionId)) {
-      const transport = transports.get(sessionId)!;
-      await transport.close();
-      transports.delete(sessionId);
-      res.json({ status: 'closed' });
-    } else {
-      res.status(404).json({ error: 'Session not found' });
-    }
   });
 }
 

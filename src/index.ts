@@ -4,7 +4,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createApp, createMCPServer, setupMCPRoutes, setupRESTRoutes } from './server.js';
+import { createApp, setupMCPRoutes, setupRESTRoutes } from './server.js';
 
 // Import and register tools
 import './tools/filesystem.js';
@@ -28,15 +28,14 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Create express app and MCP server
+  // Create express app
   const app = createApp();
-  const mcpServer = createMCPServer();
 
   // Set up REST API routes (simple direct tool access)
   setupRESTRoutes(app);
 
-  // Set up MCP routes (full protocol support)
-  await setupMCPRoutes(app, mcpServer);
+  // Set up MCP routes (full protocol support; one MCP server per session)
+  setupMCPRoutes(app);
 
   // Start server
   if (useHttps) {
