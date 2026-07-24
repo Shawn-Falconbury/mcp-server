@@ -33,16 +33,48 @@ const ALLOWED_PLAYBOOKS = new Set([
   'playbooks/linux/system_report.yml',
 ]);
 
-// Allowed ad-hoc modules
-const ALLOWED_MODULES = new Set([
-  'ping',
-  'setup',
-  'command',
-  'shell',
-  'ios_facts',
-  'ios_command',
-  'ios_ping',
-]);
+// ============================================================================
+// Ad-hoc module allowlist
+//
+// For Linux hosts this is an ergonomics control, NOT a security boundary:
+// `shell` is on the list, so anything copy/file/lineinfile can do is already
+// reachable through a shell command. Withholding those modules buys no safety
+// and costs real friction. The actual boundaries are the MCP auth layer, pi1's
+// SSH access to lx02, and ansible's inventory scope.
+//
+// For network_cli hosts (Cisco) it IS a real boundary, because `shell` does not
+// apply there — the module is the only lever. That is why `ios_config` and `raw`
+// stay off: config changes to network gear go through the reviewed playbooks in
+// ALLOWED_PLAYBOOKS, which are versioned and have a rollback path.
+//
+// Override with ANSIBLE_ALLOWED_MODULES in .env (comma-separated).
+// ============================================================================
+const DEFAULT_ALLOWED_MODULES = [
+  // connectivity and facts
+  'ping', 'setup',
+  // command execution
+  'command', 'shell',
+  // files and content
+  'copy', 'file', 'stat', 'slurp', 'fetch', 'find',
+  'lineinfile', 'blockinfile', 'template', 'unarchive', 'get_url',
+  // packages and services
+  'package', 'apt', 'dnf', 'service', 'systemd', 'systemd_service',
+  // misc
+  'git', 'uri',
+  // Cisco IOS — read-only only, see note above
+  'ios_facts', 'ios_command', 'ios_ping',
+];
+
+const envAllowedModules = process.env.ANSIBLE_ALLOWED_MODULES
+  ?.split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const ALLOWED_MODULES = new Set(
+  envAllowedModules && envAllowedModules.length > 0
+    ? envAllowedModules
+    : DEFAULT_ALLOWED_MODULES,
+);
 
 // ============================================================================
 // Quoting and validation
@@ -475,8 +507,12 @@ registerTool({
   tool: {
     name: 'ansible_run_adhoc',
     description:
-      'Run an ad-hoc Ansible command against hosts. Supports ping, setup (facts), command, shell, and Cisco IOS modules. ' +
-      'Shell metacharacters in `args` (| > & ( ) * + \\ etc.) are passed through intact. ' +
+      'Run an ad-hoc Ansible command against hosts. Supports command/shell, file and content modules ' +
+      '(copy, file, stat, slurp, fetch, find, lineinfile, blockinfile, template, unarchive, get_url), ' +
+      'package/service modules, git, uri, and read-only Cisco IOS modules. ' +
+      'Shell metacharacters in `args` (| > < & ; $ ( ) * + ? ! ~ ^ % \\ and backticks) pass through ' +
+      'intact, as do heredocs and multi-line payloads. ' +
+      'Structured module args may be passed as JSON, e.g. {"dest":"/tmp/x","content":"hello"}. ' +
       'Malformed `target` or `module` values are rejected with an error rather than rewritten.',
     inputSchema: {
       type: 'object',
@@ -487,11 +523,14 @@ registerTool({
         },
         module: {
           type: 'string',
-          description: 'Ansible module to run (e.g., "ping", "command", "setup", "ios_command")',
+          description: 'Ansible module to run (e.g., "shell", "command", "copy", "file", "stat", "setup", "ios_command")',
         },
         args: {
           type: 'string',
-          description: 'Module arguments (e.g., "uptime" for command module, "commands=show version" for ios_command)',
+          description:
+            'Module arguments. Free-form for command/shell ("docker ps -a"), key=value for most ' +
+            'modules ("dest=/tmp/x mode=0644"), or a JSON object for anything with awkward quoting ' +
+            '({"dest":"/tmp/x","content":"multi word\\ncontent"}).',
         },
         allow_templating: {
           type: 'boolean',
@@ -512,7 +551,7 @@ registerTool({
       );
       const module = must(
         String(args.module ?? ''), RE_MODULE, 'module',
-        'Expected a module name like "shell", "command", "ping".',
+        'Expected a module name like "shell", "command", "copy", "ping".',
       );
 
       if (!ALLOWED_MODULES.has(module)) {
@@ -532,9 +571,17 @@ registerTool({
         throw new ValidationError('args contains a NUL byte.');
       }
 
+      // Ansible JSON-parses the -a string when it both startswith('{') and
+      // endswith('}') (cli/adhoc.py _play_ds). A caller passing structured
+      // module args that way is doing it deliberately, so leave it alone —
+      // wrapping would corrupt the JSON.
+      const looksLikeJsonArgs = moduleArgs.startsWith('{') && moduleArgs.endsWith('}');
+
       // Jinja containment. Ansible templates the -a string before module
       // dispatch, which is what breaks `docker ps --format '{{.Names}}'`.
-      if (args.allow_templating !== true && /\{\{|\{%/.test(moduleArgs)) {
+      // The trailing space is load-bearing: it defeats the endswith('}') test
+      // above so the raw wrapper is not itself mistaken for JSON.
+      if (args.allow_templating !== true && !looksLikeJsonArgs && /\{\{|\{%/.test(moduleArgs)) {
         moduleArgs = `{% raw %}${moduleArgs}{% endraw %} `;
       }
 
