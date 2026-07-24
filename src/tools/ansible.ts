@@ -1,8 +1,8 @@
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { registerTool } from './index.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ============================================================================
 // Ansible Tools — Execute Ansible commands on RHEL 10 VM via SSH
@@ -44,15 +44,94 @@ const ALLOWED_MODULES = new Set([
   'ios_ping',
 ]);
 
+// ============================================================================
+// Quoting and validation
+//
+// Design note (2026-07-23): this file previously used a character-stripping
+// sanitize() that silently deleted ( ) + * | > & \ and others from user input.
+// That corrupted commands without warning — a psql query was rewritten into a
+// different, still-valid query that returned wrong results. It also did NOT
+// close the hole it was aimed at: it allowed ' through, which broke out of the
+// inner -a '...' quoting on the control node, and it interpolated `target`
+// unquoted, permitting arbitrary ansible flag injection (--become, -e, -m).
+//
+// The replacement rule is: QUOTE user substrings, REJECT malformed identifiers,
+// never rewrite silently. Server-authored shell syntax (&&, ||, 2>/dev/null,
+// globs) stays outside the quotes where it is still live.
+// ============================================================================
+
 /**
- * Execute a command on the RHEL 10 VM via SSH
+ * POSIX single-quote escaping. Safe for every byte except NUL.
+ * Closes the quote, emits a literal quote, reopens.
  */
-async function sshExec(command: string, timeout: number = SSH_TIMEOUT): Promise<{ stdout: string; stderr: string }> {
-  // Escape the command for SSH
-  const sshCommand = `ssh -o ConnectTimeout=10 -o BatchMode=yes ${SSH_HOST} 'cd ${ANSIBLE_DIR} && ${command.replace(/'/g, "'\\''")}'`;
+function shq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+class ValidationError extends Error {}
+
+// Ansible host patterns legitimately use : ! & * [ ] for set operations and
+// ranges (webservers:!staging, all:&linux, web[01:05]). The old sanitize()
+// stripped ! & * — so those patterns were quietly broken too.
+const RE_TARGET = /^[A-Za-z0-9_][A-Za-z0-9_.:!&*[\]-]*$/;
+const RE_MODULE = /^[a-z0-9_.]+$/;
+const RE_PLAYBOOK = /^[A-Za-z0-9_./-]+$/;
+const RE_TAGS = /^[A-Za-z0-9_,.-]+$/;
+
+function must(value: string, re: RegExp, field: string, hint: string): string {
+  if (!re.test(value)) {
+    throw new ValidationError(
+      `Invalid ${field}: ${JSON.stringify(value)}\n${hint}\n` +
+      'Nothing was executed. This input is rejected, not rewritten.'
+    );
+  }
+  return value;
+}
+
+/** Coerce a numeric option to a bounded integer. */
+function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Shared error shaping so ValidationError surfaces cleanly, not as a stack. */
+function toErrorResult(error: unknown, prefix: string) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{
+      type: 'text' as const,
+      text: error instanceof ValidationError ? message : `${prefix}: ${message}`,
+    }],
+    isError: true,
+  };
+}
+
+/**
+ * Execute a command on the RHEL 10 VM via SSH.
+ *
+ * `remoteCommand` must already be safe: server-authored shell syntax plus
+ * shq()-quoted user substrings. Passing argv (execFile, not exec) means the
+ * Pi's local /bin/sh never parses any of this — one whole parser layer gone.
+ */
+async function sshExec(
+  remoteCommand: string,
+  timeout: number = SSH_TIMEOUT,
+): Promise<{ stdout: string; stderr: string }> {
+  const remote = `cd ${ANSIBLE_DIR} && ${remoteCommand}`;
+  const argv = [
+    '-o', 'ConnectTimeout=10',
+    '-o', 'BatchMode=yes',
+    SSH_HOST,
+    remote,
+  ];
+
+  if (process.env.MCP_DEBUG_ANSIBLE) {
+    console.error('[ansible] remote:', remote);
+  }
 
   try {
-    const { stdout, stderr } = await execAsync(sshCommand, {
+    const { stdout, stderr } = await execFileAsync('ssh', argv, {
       timeout,
       maxBuffer: 1024 * 1024 * 5,  // 5MB buffer for large outputs
     });
@@ -71,14 +150,6 @@ async function sshExec(command: string, timeout: number = SSH_TIMEOUT): Promise<
     }
     throw new Error(execError.message || 'SSH command failed');
   }
-}
-
-/**
- * Sanitize user input to prevent command injection
- */
-function sanitize(input: string): string {
-  // Allow alphanumeric, hyphens, underscores, dots, slashes, colons, commas, equals, spaces
-  return input.replace(/[^a-zA-Z0-9\-_./: ,=@[\]{}'"]/g, '');
 }
 
 // ── ansible_run_playbook ──
@@ -114,45 +185,53 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const playbook = sanitize(args.playbook as string);
-
-    if (!ALLOWED_PLAYBOOKS.has(playbook)) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Playbook not allowed: ${playbook}\n\nAllowed playbooks:\n${Array.from(ALLOWED_PLAYBOOKS).join('\n')}`,
-        }],
-        isError: true,
-      };
-    }
-
-    let cmd = `ansible-playbook ${playbook}`;
-
-    if (args.limit) {
-      cmd += ` --limit '${sanitize(args.limit as string)}'`;
-    }
-    if (args.tags) {
-      cmd += ` --tags '${sanitize(args.tags as string)}'`;
-    }
-    if (args.extra_vars) {
-      cmd += ` -e '${sanitize(args.extra_vars as string)}'`;
-    }
-    if (args.check_mode) {
-      cmd += ' --check --diff';
-    }
-
     try {
+      const playbook = must(
+        String(args.playbook ?? ''), RE_PLAYBOOK, 'playbook',
+        'Expected a path relative to /opt/ansible-network.',
+      );
+
+      if (!ALLOWED_PLAYBOOKS.has(playbook)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Playbook not allowed: ${playbook}\n\nAllowed playbooks:\n${Array.from(ALLOWED_PLAYBOOKS).join('\n')}`,
+          }],
+          isError: true,
+        };
+      }
+
+      let cmd = `ansible-playbook ${shq(playbook)}`;
+
+      if (args.limit) {
+        const limit = must(
+          String(args.limit), RE_TARGET, 'limit',
+          'Expected an Ansible host pattern (letters, digits, . _ - : ! & * [ ]).',
+        );
+        cmd += ` --limit ${shq(limit)}`;
+      }
+      if (args.tags) {
+        const tags = must(
+          String(args.tags), RE_TAGS, 'tags',
+          'Expected comma-separated tag names.',
+        );
+        cmd += ` --tags ${shq(tags)}`;
+      }
+      if (args.extra_vars) {
+        // shq() is sufficient here: JSON braces, quotes and spaces must survive.
+        cmd += ` -e ${shq(String(args.extra_vars))}`;
+      }
+      if (args.check_mode) {
+        cmd += ' --check --diff';
+      }
+
       const { stdout, stderr } = await sshExec(cmd, SSH_TIMEOUT);
       const output = stdout + (stderr ? `\n--- STDERR ---\n${stderr}` : '');
       return {
         content: [{ type: 'text', text: output || '(no output)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Playbook execution failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Playbook execution failed');
     }
   },
 });
@@ -174,21 +253,20 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const target = sanitize(args.target as string);
-    const cmd = `ansible ${target} -m ping`;
-
     try {
+      const target = must(
+        String(args.target ?? ''), RE_TARGET, 'target',
+        'Expected an Ansible host pattern (letters, digits, . _ - : ! & * [ ]).',
+      );
+      const cmd = `ansible ${shq(target)} -m ping`;
+
       const { stdout, stderr } = await sshExec(cmd, SSH_TIMEOUT_SHORT);
       const output = stdout + (stderr ? `\n--- STDERR ---\n${stderr}` : '');
       return {
         content: [{ type: 'text', text: output || '(no output)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Ping failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Ping failed');
     }
   },
 });
@@ -214,23 +292,26 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const target = sanitize((args.target as string) || 'all');
-    const graphFlag = args.show_vars ? '--list' : '--graph';
-
-    const cmd = `ansible-inventory ${graphFlag} ${target !== 'all' ? `--host ${target} 2>/dev/null || ansible-inventory --graph ${target}` : ''}`;
-
     try {
+      const target = must(
+        String(args.target ?? 'all') || 'all', RE_TARGET, 'target',
+        'Expected an Ansible host or group name.',
+      );
+      const graphFlag = args.show_vars ? '--list' : '--graph';
+
+      // The || and 2>/dev/null below are server-authored and stay live;
+      // only the target is quoted.
+      const cmd = target !== 'all'
+        ? `ansible-inventory ${graphFlag} --host ${shq(target)} 2>/dev/null || ansible-inventory --graph ${shq(target)}`
+        : `ansible-inventory ${graphFlag}`;
+
       const { stdout, stderr } = await sshExec(cmd, SSH_TIMEOUT_SHORT);
       const output = stdout + (stderr ? `\n--- STDERR ---\n${stderr}` : '');
       return {
         content: [{ type: 'text', text: output || '(no output)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Inventory query failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Inventory query failed');
     }
   },
 });
@@ -257,47 +338,44 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const logType = (args.log_type as string) || 'ansible';
-    const lines = (args.lines as number) || 50;
-
-    // Map log types to file patterns
-    const logPaths: Record<string, string> = {
-      ansible: 'logs/ansible.log',
-      backup: 'logs/backup_*.log',
-      compliance: 'logs/compliance_*.log',
-      change_detection: 'logs/change_detection_*.log',
-      linux_health: 'logs/linux_health_*.log',
-      linux_backup: 'logs/linux_backup_*.log',
-      linux_update: 'logs/linux_update_*.log',
-    };
-
-    const logPath = logPaths[logType];
-    if (!logPath) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Unknown log type: ${logType}\nValid types: ${Object.keys(logPaths).join(', ')}`,
-        }],
-        isError: true,
-      };
-    }
-
-    // For wildcard patterns, get the most recent file
-    const cmd = logPath.includes('*')
-      ? `ls -t ${logPath} 2>/dev/null | head -1 | xargs tail -n ${lines} 2>/dev/null || echo "No ${logType} logs found"`
-      : `tail -n ${lines} ${logPath} 2>/dev/null || echo "Log file not found: ${logPath}"`;
-
     try {
+      const logType = String(args.log_type ?? 'ansible');
+      const lines = boundedInt(args.lines, 50, 1, 10000);
+
+      // Map log types to file patterns. Keys are the only accepted input, so
+      // the resulting path is server-controlled — no user text reaches the shell.
+      const logPaths: Record<string, string> = {
+        ansible: 'logs/ansible.log',
+        backup: 'logs/backup_*.log',
+        compliance: 'logs/compliance_*.log',
+        change_detection: 'logs/change_detection_*.log',
+        linux_health: 'logs/linux_health_*.log',
+        linux_backup: 'logs/linux_backup_*.log',
+        linux_update: 'logs/linux_update_*.log',
+      };
+
+      const logPath = logPaths[logType];
+      if (!logPath) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Unknown log type: ${logType}\nValid types: ${Object.keys(logPaths).join(', ')}`,
+          }],
+          isError: true,
+        };
+      }
+
+      // For wildcard patterns, get the most recent file
+      const cmd = logPath.includes('*')
+        ? `ls -t ${logPath} 2>/dev/null | head -1 | xargs tail -n ${lines} 2>/dev/null || echo "No ${logType} logs found"`
+        : `tail -n ${lines} ${logPath} 2>/dev/null || echo "Log file not found: ${logPath}"`;
+
       const { stdout } = await sshExec(cmd, SSH_TIMEOUT_SHORT);
       return {
         content: [{ type: 'text', text: stdout || '(empty log)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Log read failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Log read failed');
     }
   },
 });
@@ -327,28 +405,24 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const count = (args.count as number) || 20;
-    const filePath = args.path ? sanitize(args.path as string) : '';
-    const showDiff = args.diff || false;
-
-    let cmd: string;
-    if (showDiff) {
-      cmd = `git log -1 --format='commit %h - %s (%cr)' ${filePath} && echo '---' && git diff HEAD~1 ${filePath}`;
-    } else {
-      cmd = `git log --oneline -n ${count} ${filePath}`;
-    }
-
     try {
+      const count = boundedInt(args.count, 20, 1, 1000);
+      const filePath = args.path
+        ? must(String(args.path), RE_PLAYBOOK, 'path', 'Expected a repository-relative path.')
+        : '';
+      const pathArg = filePath ? ` -- ${shq(filePath)}` : '';
+      const showDiff = args.diff === true;
+
+      const cmd = showDiff
+        ? `git log -1 --format='commit %h - %s (%cr)'${pathArg} && echo '---' && git diff HEAD~1${pathArg}`
+        : `git log --oneline -n ${count}${pathArg}`;
+
       const { stdout } = await sshExec(cmd, SSH_TIMEOUT_SHORT);
       return {
         content: [{ type: 'text', text: stdout || '(no commits found)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Git log failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Git log failed');
     }
   },
 });
@@ -370,28 +444,28 @@ registerTool({
     },
   },
   handler: async (args) => {
-    const device = args.device ? sanitize(args.device as string) : '';
-
-    let cmd: string;
-    if (device) {
-      // Get the latest report for a specific device
-      cmd = `ls -t compliance_reports/${device}_*.txt 2>/dev/null | head -1 | xargs cat 2>/dev/null || echo "No compliance report found for ${device}"`;
-    } else {
-      // List all reports with timestamps
-      cmd = `ls -lt compliance_reports/*.txt 2>/dev/null | head -20 || echo "No compliance reports found"`;
-    }
-
     try {
+      const device = args.device
+        ? must(String(args.device), RE_TARGET, 'device', 'Expected a device name from inventory.')
+        : '';
+
+      let cmd: string;
+      if (device) {
+        // shq() closes before _*.txt so the glob stays live outside the quotes.
+        cmd =
+          `ls -t compliance_reports/${shq(device)}_*.txt 2>/dev/null | head -1 | xargs cat 2>/dev/null ` +
+          `|| echo "No compliance report found for" ${shq(device)}`;
+      } else {
+        // List all reports with timestamps
+        cmd = `ls -lt compliance_reports/*.txt 2>/dev/null | head -20 || echo "No compliance reports found"`;
+      }
+
       const { stdout } = await sshExec(cmd, SSH_TIMEOUT_SHORT);
       return {
         content: [{ type: 'text', text: stdout || '(no reports found)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Report read failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Report read failed');
     }
   },
 });
@@ -400,7 +474,10 @@ registerTool({
 registerTool({
   tool: {
     name: 'ansible_run_adhoc',
-    description: 'Run an ad-hoc Ansible command against hosts. Supports ping, setup (facts), command, shell, and Cisco IOS modules.',
+    description:
+      'Run an ad-hoc Ansible command against hosts. Supports ping, setup (facts), command, shell, and Cisco IOS modules. ' +
+      'Shell metacharacters in `args` (| > & ( ) * + \\ etc.) are passed through intact. ' +
+      'Malformed `target` or `module` values are rejected with an error rather than rewritten.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -416,42 +493,65 @@ registerTool({
           type: 'string',
           description: 'Module arguments (e.g., "uptime" for command module, "commands=show version" for ios_command)',
         },
+        allow_templating: {
+          type: 'boolean',
+          description:
+            'Let Ansible Jinja-template the args string (default false). When false, args containing ' +
+            '{{ }} or {% %} are wrapped in {% raw %} so Docker --format, Go templates and Jinja-like ' +
+            'literals pass through intact.',
+        },
       },
       required: ['target', 'module'],
     },
   },
   handler: async (args) => {
-    const target = sanitize(args.target as string);
-    const module = sanitize(args.module as string);
-    const moduleArgs = args.args ? sanitize(args.args as string) : '';
-
-    if (!ALLOWED_MODULES.has(module)) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Module not allowed: ${module}\n\nAllowed modules: ${Array.from(ALLOWED_MODULES).join(', ')}`,
-        }],
-        isError: true,
-      };
-    }
-
-    let cmd = `ansible ${target} -m ${module}`;
-    if (moduleArgs) {
-      cmd += ` -a '${moduleArgs}'`;
-    }
-
     try {
+      const target = must(
+        String(args.target ?? ''), RE_TARGET, 'target',
+        'Expected an Ansible host pattern (letters, digits, . _ - : ! & * [ ]).',
+      );
+      const module = must(
+        String(args.module ?? ''), RE_MODULE, 'module',
+        'Expected a module name like "shell", "command", "ping".',
+      );
+
+      if (!ALLOWED_MODULES.has(module)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Module not allowed: ${module}\n\nAllowed modules: ${Array.from(ALLOWED_MODULES).join(', ')}`,
+          }],
+          isError: true,
+        };
+      }
+
+      let moduleArgs = args.args ? String(args.args) : '';
+
+      // A NUL byte cannot survive an argv boundary — reject rather than truncate silently.
+      if (moduleArgs.includes('\0')) {
+        throw new ValidationError('args contains a NUL byte.');
+      }
+
+      // Jinja containment. Ansible templates the -a string before module
+      // dispatch, which is what breaks `docker ps --format '{{.Names}}'`.
+      if (args.allow_templating !== true && /\{\{|\{%/.test(moduleArgs)) {
+        moduleArgs = `{% raw %}${moduleArgs}{% endraw %} `;
+      }
+
+      // shq() on target as well: even if RE_TARGET ever lets something through,
+      // ansible receives exactly one host pattern and cannot be fed extra flags.
+      let cmd = `ansible ${shq(target)} -m ${shq(module)}`;
+      if (moduleArgs) {
+        cmd += ` -a ${shq(moduleArgs)}`;
+      }
+
       const { stdout, stderr } = await sshExec(cmd, SSH_TIMEOUT);
       const output = stdout + (stderr ? `\n--- STDERR ---\n${stderr}` : '');
       return {
         content: [{ type: 'text', text: output || '(no output)' }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Ad-hoc command failed: ${message}` }],
-        isError: true,
-      };
+      return toErrorResult(error, 'Ad-hoc command failed');
     }
   },
 });
