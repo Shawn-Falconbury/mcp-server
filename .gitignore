@@ -23,3 +23,12 @@ Thumbs.db
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.env.bak-*
+
+# Env files and editor backups. The timestamped backups the deploy script
+# leaves behind are named like .env.18139.2026-07-25@15:23:16~ , which
+# ".env.bak-*" above does NOT match -- these patterns do.
+.env
+.env.*
+!.env.example
+*~
