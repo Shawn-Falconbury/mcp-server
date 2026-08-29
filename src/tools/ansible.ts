@@ -5,11 +5,11 @@ import { registerTool } from './index.js';
 const execFileAsync = promisify(execFile);
 
 // ============================================================================
-// Ansible Tools — Execute Ansible commands on RHEL 10 VM via SSH
+// Ansible Tools — Execute Ansible commands on a control node via SSH
 // ============================================================================
 
-const SSH_HOST = 'ansible-rhel10';  // Defined in ~/.ssh/config
-const ANSIBLE_DIR = '/opt/ansible-network';
+const SSH_HOST = process.env.ANSIBLE_SSH_HOST || 'ansible-control';  // Override in .env; ~/.ssh/config host
+const ANSIBLE_DIR = process.env.ANSIBLE_DIR || '/opt/ansible';
 const SSH_TIMEOUT = 120000;  // 2 minutes for playbook runs
 const SSH_TIMEOUT_SHORT = 30000;  // 30 seconds for quick commands
 
@@ -39,8 +39,8 @@ const ALLOWED_PLAYBOOKS = new Set([
 // For Linux hosts this is an ergonomics control, NOT a security boundary:
 // `shell` is on the list, so anything copy/file/lineinfile can do is already
 // reachable through a shell command. Withholding those modules buys no safety
-// and costs real friction. The actual boundaries are the MCP auth layer, pi1's
-// SSH access to lx02, and ansible's inventory scope.
+// and costs real friction. The actual boundaries are the MCP auth layer, the
+// control node's SSH access to inventory hosts, and ansible's inventory scope.
 //
 // For network_cli hosts (Cisco) it IS a real boundary, because `shell` does not
 // apply there — the module is the only lever. That is why `ios_config` and `raw`
@@ -80,7 +80,7 @@ const ALLOWED_MODULES = new Set(
 // Quoting and validation
 //
 // Design note (2026-07-23): this file previously used a character-stripping
-// sanitize() that silently deleted ( ) + * | > & \ and others from user input.
+// sanitize() that silently deleted ( ) + * | > & \\ and others from user input.
 // That corrupted commands without warning — a psql query was rewritten into a
 // different, still-valid query that returned wrong results. It also did NOT
 // close the hole it was aimed at: it allowed ' through, which broke out of the
@@ -140,7 +140,7 @@ function toErrorResult(error: unknown, prefix: string) {
 }
 
 /**
- * Execute a command on the RHEL 10 VM via SSH.
+ * Execute a command on the Ansible control node via SSH.
  *
  * `remoteCommand` must already be safe: server-authored shell syntax plus
  * shq()-quoted user substrings. Passing argv (execFile, not exec) means the
@@ -188,17 +188,17 @@ async function sshExec(
 registerTool({
   tool: {
     name: 'ansible_run_playbook',
-    description: 'Run an Ansible playbook on the RHEL 10 control node. Supports --limit, --tags, --check, --diff, and extra vars.',
+    description: 'Run an Ansible playbook on the Ansible control node. Supports --limit, --tags, --check, --diff, and extra vars.',
     inputSchema: {
       type: 'object',
       properties: {
         playbook: {
           type: 'string',
-          description: 'Playbook path relative to /opt/ansible-network (e.g., "playbooks/backup_configs.yml", "playbooks/linux/service_health.yml")',
+          description: 'Playbook path relative to the Ansible project directory (e.g., "playbooks/backup_configs.yml", "playbooks/linux/service_health.yml")',
         },
         limit: {
           type: 'string',
-          description: 'Limit execution to specific hosts or groups (e.g., "OFFICE-ISO-R1", "all_linux", "pi1")',
+          description: 'Limit execution to specific hosts or groups (e.g., "ROUTER-01", "all_linux", "linux-01")',
         },
         tags: {
           type: 'string',
@@ -206,7 +206,7 @@ registerTool({
         },
         extra_vars: {
           type: 'string',
-          description: 'Extra variables as key=value or JSON (e.g., "target_hosts=pi1", "docker_update=true")',
+          description: 'Extra variables as key=value or JSON (e.g., "target_hosts=linux-01", "docker_update=true")',
         },
         check_mode: {
           type: 'boolean',
@@ -220,7 +220,7 @@ registerTool({
     try {
       const playbook = must(
         String(args.playbook ?? ''), RE_PLAYBOOK, 'playbook',
-        'Expected a path relative to /opt/ansible-network.',
+        'Expected a path relative to the Ansible project directory.',
       );
 
       if (!ALLOWED_PLAYBOOKS.has(playbook)) {
@@ -278,7 +278,7 @@ registerTool({
       properties: {
         target: {
           type: 'string',
-          description: 'Host, group, or pattern to ping (e.g., "all", "all_linux", "OFFICE-ISO-R1", "pi1")',
+          description: 'Host, group, or pattern to ping (e.g., "all", "all_linux", "ROUTER-01", "linux-01")',
         },
       },
       required: ['target'],
@@ -426,7 +426,7 @@ registerTool({
         },
         path: {
           type: 'string',
-          description: 'Filter to a specific path (e.g., "configs/routers/OFFICE-ISO-R1/", "configs/linux/pi1/")',
+          description: 'Filter to a specific path (e.g., "configs/routers/ROUTER-01/", "configs/linux/linux-01/")',
         },
         diff: {
           type: 'boolean',
@@ -469,7 +469,7 @@ registerTool({
       properties: {
         device: {
           type: 'string',
-          description: 'Device name to get report for (e.g., "OFFICE-ISO-R1"). Omit to list all reports.',
+          description: 'Device name to get report for (e.g., "ROUTER-01"). Omit to list all reports.',
         },
       },
       required: [],
@@ -519,7 +519,7 @@ registerTool({
       properties: {
         target: {
           type: 'string',
-          description: 'Host, group, or pattern (e.g., "all", "OFFICE-ISO-R1", "all_linux", "pi2")',
+          description: 'Host, group, or pattern (e.g., "all", "ROUTER-01", "all_linux", "linux-02")',
         },
         module: {
           type: 'string',
@@ -603,4 +603,4 @@ registerTool({
   },
 });
 
-console.log('[TOOLS] Ansible tools loaded (RHEL 10 via SSH)');
+console.log('[TOOLS] Ansible tools loaded (control node via SSH)');
